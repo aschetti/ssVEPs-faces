@@ -1,0 +1,1454 @@
+---
+title: "EmoSSR: behavior"
+author: '[Antonio Schettino](https://osf.io/zbv65/ "Antonio Schettino")'
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    code_folding: hide
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup_environment, echo = FALSE, warning = FALSE, message = FALSE}
+
+### install packages
+# install.packages(c("knitr",
+#                    "tidyverse", "Rmisc", "mice"
+#                    "parallel", "rstan", "brms",
+#                    "bayesplot", "tidybayes", "bayestestR", "BEST", "viridis", "cowplot"),
+#                  dependencies = TRUE)
+# devtools::install_github("mikabr/ggpirate", dependencies = TRUE)
+
+### load packages
+# document
+library(knitr)
+# data manipulation
+library(tidyverse)
+library(Rmisc)
+library(mice)
+# data analysis
+library(parallel)
+library(rstan)
+library(brms)
+# summary and plotting
+library(bayesplot)
+library(tidybayes)
+# library(sjstats)
+library(bayestestR)
+library(BEST)
+library(viridis)
+library(ggpirate)
+library(cowplot)
+
+# for RMarkdown
+options(
+  digits = 4, # number of digits
+  width = 120, # output width
+  scipen = 999 # disable scientific notation (default: scipen = 0)
+)
+opts_chunk$set(
+  warning = FALSE, # no package warnings
+  message = FALSE, # no package messages
+  fig.width = 18, # figure width
+  fig.height = 9 # figure height
+)
+
+# ggplot custom theme
+theme_EmoSSR <- theme_minimal(base_size = 18) +
+  theme(
+    strip.text = element_text(
+      hjust = .5,
+      size = 24
+    ),
+    panel.grid = element_blank(),
+    legend.box.background = element_rect(color = "transparent"),
+    plot.title = element_text(size = 26, hjust = .5)
+  )
+
+# viridis color palette for plots Bayes
+color_scheme_set("viridis")
+
+seed.smorfia <- 12 # 'e surdate
+set.seed(seed.smorfia) # seed for random number generation
+
+# setup for STAN
+rstan_options(auto_write = TRUE) # avoid recompilation of unchanged models
+options(mc.cores = parallel::detectCores())
+num.cores <- 8 # number of cores in processor of computer used for analysis (parallel::detectCores())
+num.chains <- num.cores # number of chains = number of cores in processor of computer used for analysis
+num.iter <- 8000 # number of samples per chain
+num.warmup <- 4000 # number of warm-up samples per chain
+num.thin <- 2 # thinning: extract one out of x samples per chain
+
+weak.priors <- c( # weakly informative priors...
+  set_prior("normal(500, 300)", class = "b", lb = 0, ub = 1000), # ... on beta coefficients
+  # (lower bound = 0 ms because RTs cannot be negative; upper bound = 1000 ms because that was the max response time)
+  set_prior("cauchy(0, 50)", class = "sd") # ... on SD of varying effects
+) # (half Cauchy ensures that RTs cannot be negative)
+
+```
+
+```{r tidy_data, eval = FALSE}
+
+setwd(paste0(getwd(), "/behavior")) # set working subdir
+
+behav.exps <- c(
+  list.files(pattern = ".csv")[2],
+  list.files(pattern = ".csv")[3],
+  list.files(pattern = ".csv")[1]
+)
+
+behav.data <- behav.exps %>%
+  map_df(~ read_csv(.)) %>%
+  mutate(
+    experiment = factor(
+      c(
+        rep("pilot1", 15 * 6),
+        rep("pilot2", 16 * 12),
+        rep("exp1", 31 * 12)
+      ),
+      levels = c("pilot1", "pilot2", "exp1")
+    ),
+    participant = as.factor(subjects),
+    orientation = as.factor(
+      case_when(
+        grepl("up", cond) ~ "upright",
+        grepl("dw", cond) ~ "inverted"
+      )
+    ),
+    variability = as.factor(
+      case_when(
+        grepl("_m", cond) ~ "high",
+        grepl("_f", cond) ~ "low",
+        TRUE ~ "NA"
+      )
+    ),
+    regularity = as.factor(
+      case_when(
+        grepl("A_", cond) | grepl("a_", cond) ~ "angry",
+        grepl("N_", cond) | grepl("n_", cond) ~ "neutral",
+        grepl("I_", cond) | grepl("i_", cond) ~ "irregular"
+      )
+    )
+  ) %>%
+  unite(condition, c(orientation, regularity, variability), sep = "_", remove = FALSE) %>%
+  dplyr::select(experiment, participant, orientation, regularity, variability, condition, RTs = "rt")
+
+# IMPUTATION MISSING DATA
+length(which(is.na(behav.data$RTs))) # number of missing values to impute
+
+# imputation (in different data frame)
+temp.behav.data <- mice(behav.data,
+  m = 1, # number of multiple imputations
+  maxit = 1000, # maximum number of iterations
+  meth = "pmm", # imputation method: Predictive mean matching (see ?mice)
+  seed = seed.smorfia # RNG seed for reproducibility
+)
+
+# graphical comparison of observed (in blue) and imputed data (in pink)
+# if the imputation was successful, the two distributions should overlap
+densityplot(temp.behav.data)
+# despite the low number of data points, the imputation was reasonably close to the observed data
+
+# insert imputed values in original data frame
+behav.data <- complete(temp.behav.data)
+
+# verify that imputation occurred
+length(which(is.na(behav.data$RTs)))
+
+write_csv(behav.data, # save imputed data
+  path = "RTs_imputed.csv"
+)
+
+rm(behav.exps, temp.behav.data) # remove unused variables
+
+```
+
+Behavioral data were collected in 2 pilots and 1 main experiment, whereas in the last experiment participants were asked to passively view the stream of faces.
+
+```{r summary_data}
+
+# setwd(paste0(getwd(), "/behavior")) # set working subdir
+
+behav.data <- read_csv("RTs_imputed.csv", # read imputed data
+  col_types = cols(
+    experiment = "f",
+    participant = "f",
+    orientation = "f",
+    regularity = "f",
+    variability = "f",
+    condition = "f"
+  )
+) %>%
+  mutate(
+    experiment = factor(experiment, levels = c("pilot1", "pilot2", "exp1"))
+  )
+
+summary.behav.data <- summarySEwithin(
+  data = behav.data,
+  measurevar = "RTs",
+  betweenvars = "experiment",
+  withinvars = c("orientation", "regularity", "variability"),
+  idvar = "participant",
+  na.rm = TRUE
+) %>%
+  mutate(
+    CI.95.low = RTs - ci,
+    CI.95.high = RTs + ci
+  ) %>%
+  dplyr::select(-c(sd, se, ci))
+
+kable(summary.behav.data, digits = 2)
+
+```
+
+```{r data_pirateplot}
+
+behav.data <- behav.data %>%
+  unite("cond4plot", c(orientation, regularity), sep = " ", remove = FALSE) %>%
+  mutate(cond4plot = factor(cond4plot,
+    levels = c(
+      "upright angry", "upright neutral", "upright irregular",
+      "inverted angry", "inverted neutral", "inverted irregular"
+    )
+  ))
+
+# pilot1 does not have the column "variability", which messes up all the other plots...
+# that's why they are created separately instead of calling facet_wrap(~ experiment, scales = "free")
+
+# pilot1
+behav.plot.pilot1 <-
+  behav.data %>%
+  filter(experiment == "pilot1") %>%
+  ggplot(aes(
+    x = cond4plot,
+    y = RTs,
+    color = cond4plot,
+    fill = cond4plot
+  )) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, color = "black", size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d() +
+  scale_color_viridis_d() +
+  scale_y_continuous(
+    limits = c(0, 800),
+    breaks = seq(0, 800, 100)
+  ) +
+  coord_cartesian(ylim = c(200, 800)) +
+  geom_hline(
+    yintercept = seq(0, 800, 100),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  labs(
+    x = "",
+    y = "ms"
+  ) +
+  ggtitle("pilot 1") +
+  theme_EmoSSR +
+  theme(legend.position = "right")
+
+# pilot2
+behav.plot.pilot2 <-
+  behav.data %>%
+  filter(experiment == "pilot2") %>%
+  ggplot(aes(
+    x = cond4plot,
+    y = RTs,
+    color = variability,
+    fill = variability
+  )) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = TRUE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(
+    limits = c(0, 800),
+    breaks = seq(0, 800, 100)
+  ) +
+  coord_cartesian(ylim = c(200, 800)) +
+  geom_hline(
+    yintercept = seq(0, 800, 100),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  labs(
+    x = "",
+    y = "ms"
+  ) +
+  ggtitle("pilot 2") +
+  theme_EmoSSR +
+  theme(legend.position = "right")
+
+# exp1
+behav.plot.exp1 <-
+  behav.data %>%
+  filter(experiment == "exp1") %>%
+  ggplot(aes(
+    x = cond4plot,
+    y = RTs,
+    color = variability,
+    fill = variability
+  )) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = TRUE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(
+    limits = c(0, 800),
+    breaks = seq(0, 800, 100)
+  ) +
+  coord_cartesian(ylim = c(200, 800)) +
+  geom_hline(
+    yintercept = seq(0, 800, 100),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  labs(
+    x = "",
+    y = "ms"
+  ) +
+  ggtitle("experiment 1") +
+  theme_EmoSSR +
+  theme(legend.position = "right")
+
+plot_grid(behav.plot.pilot1, behav.plot.pilot2, behav.plot.exp1,
+          ncol = 1)
+
+# ### save plots to file
+# # pilot1
+# file.behav.plot.pilot1 <- behav.plot.pilot1 +
+#   scale_y_continuous(
+#     limits = c(0, 800),
+#     breaks = seq(0, 800, 50)
+#   ) +
+#   geom_hline(
+#     yintercept = seq(0, 800, 50),
+#     linetype = "dotted",
+#     colour = "#999999",
+#     size = .8,
+#     alpha = .5
+#   ) +
+#   coord_cartesian(ylim = c(300, 600))
+# 
+# save_plot(paste0(getwd(), "/pilot1_behavior.svg"),
+#           file.behav.plot.pilot1,
+#           base_aspect_ratio = 1,
+#           base_width = 11
+#           )
+# 
+# # pilot2
+# file.behav.plot.pilot2 <- behav.plot.pilot2 +
+#   coord_cartesian(ylim = c(300, 800))
+# 
+# save_plot(paste0(getwd(), "/pilot2_behavior.svg"),
+#           file.behav.plot.pilot2,
+#           base_aspect_ratio = 1,
+#           base_width = 11
+#           )
+# 
+# # exp1
+# save_plot(paste0(getwd(), "/exp1_behavior.svg"),
+#           behav.plot.exp1,
+#           base_aspect_ratio = 1,
+#           base_width = 12
+#           )
+
+```
+
+For the statistical analyses, we fit Bayesian multilevel models using `brms`. The constant effect was **condition**. Intercepts and slopes were allowed to vary as a function of *participant*.
+
+# Pilot 1
+
+* flickering frequency: 15 Hz 
+* regularity: 5 Hz
+* 9 face identities
+* task: detect dots on faces
+
+```{r pilot1_brms, eval = FALSE}
+
+# subset data
+behav.pilot1 <- behav.data %>%
+  filter(experiment == "pilot1") %>%
+  dplyr::select(-variability) %>%
+  droplevels() %>%
+  mutate(condition = as.factor(gsub("_NA", "", condition)))
+
+pilot1.model <- brm(RTs ~ 0 + condition # constant effects
++ (0 + condition | participant), # varying effects
+data = behav.pilot1, # subset data current experiment
+family = gaussian(), # likelihood function
+prior = weak.priors, # priors
+sample_prior = TRUE, # draw samples from the prior distribution
+inits = "0", # initial parameter values in the chains
+control = list(
+  adapt_delta = .99, # parameters of NUTS sampler
+  max_treedepth = 15
+),
+chains = num.chains, # number of chains
+iter = num.iter, # number of iterations
+warmup = num.warmup, # number of warm-up samples
+thin = num.thin, # thinning rate
+algorithm = "sampling", # type of sampling algorithm
+cores = num.chains, # number of processor cores to use when running chains in parallel
+seed = seed.smorfia # RNG seed
+)
+
+saveRDS(pilot1.model, file = "pilot1_model.rds", compress = "gzip") # save results
+
+```
+
+```{r pilot1_model_diagnostics}
+
+# subset data
+behav.pilot1 <- behav.data %>%
+  filter(experiment == "pilot1") %>%
+  dplyr::select(-variability) %>%
+  droplevels() %>%
+  mutate(condition = as.factor(gsub("_NA", "", condition)))
+
+# load model
+pilot1.model <- readRDS("pilot1_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot1.model <-
+  describe_posterior(pilot1.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  mutate(
+    Parameter = gsub("b_condition", "", Parameter),
+    Parameter2 = gsub("_", " ", Parameter),
+    condition = factor(Parameter2,
+      levels =
+        c(
+          "upright angry", "upright neutral", "upright irregular",
+          "inverted angry", "inverted neutral", "inverted irregular"
+        )
+    )
+  ) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot1.model, digits = 2)
+
+# MCMC chain convergence
+pilot1.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "Chain" = ".chain",
+    "upright angry" = "b_conditionupright_angry",
+    "upright neutral" = "b_conditionupright_neutral",
+    "upright irregular" = "b_conditionupright_irregular",
+    "inverted angry" = "b_conditioninverted_angry",
+    "inverted neutral" = "b_conditioninverted_neutral",
+    "inverted irregular" = "b_conditioninverted_irregular"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(nrow = 3)) +
+  ggtitle("chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+# posterior predictive checks
+pilot1.model %>%
+  posterior_predict(draws = 500) %>%
+  ppc_stat_grouped(
+    y = pull(behav.pilot1, RTs),
+    group = pull(behav.pilot1, cond4plot),
+    stat = "mean"
+  ) +
+  ggtitle("posterior predictive checks") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+```
+
+```{r pilot1_hypothesis_testing}
+
+pilot1.posterior.test <- pilot1.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "upright angry" = "b_conditionupright_angry",
+    "upright neutral" = "b_conditionupright_neutral",
+    "upright irregular" = "b_conditionupright_irregular",
+    "inverted angry" = "b_conditioninverted_angry",
+    "inverted neutral" = "b_conditioninverted_neutral",
+    "inverted irregular" = "b_conditioninverted_irregular"
+  ) %>%
+  mutate(
+    ### orientation (upright minus inverted)
+    # angry
+    diff.angry.uprightVSinverted = `upright angry` - `inverted angry`,
+    # neutral
+    diff.neutral.uprightVSinverted = `upright neutral` - `inverted neutral`,
+    # irregular
+    diff.irregular.uprightVSinverted = `upright irregular` - `inverted irregular`,
+    ### regularity
+    ## upright
+    # angry minus neutral
+    diff.upright.angryVSneutral = `upright angry` - `upright neutral`,
+    # angry minus irregular
+    diff.upright.angryVSirregular = `upright angry` - `upright irregular`,
+    # neutral minus irregular
+    diff.upright.neutralVSirregular = `upright neutral` - `upright irregular`,
+    ## inverted
+    # angry minus neutral
+    diff.inverted.angryVSneutral = `inverted angry` - `inverted neutral`,
+    # angry minus irregular
+    diff.inverted.angryVSirregular = `inverted angry` - `inverted irregular`,
+    # neutral minus irregular
+    diff.inverted.neutralVSirregular = `inverted neutral` - `inverted irregular`
+  ) %>%
+  gather(key = "condition", value = "RTs") %>%
+  filter(condition == c("diff.angry.uprightVSinverted",
+                        "diff.neutral.uprightVSinverted",
+                        "diff.irregular.uprightVSinverted",
+                        "diff.upright.angryVSneutral",
+                        "diff.upright.angryVSirregular",
+                        "diff.upright.neutralVSirregular",
+                        "diff.inverted.angryVSneutral",
+                        "diff.inverted.angryVSirregular",
+                        "diff.inverted.neutralVSirregular")) %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+                            levels = c("diff.angry.uprightVSinverted",
+                                       "diff.neutral.uprightVSinverted",
+                                       "diff.irregular.uprightVSinverted",
+                                       "diff.upright.angryVSneutral",
+                                       "diff.upright.angryVSirregular",
+                                       "diff.upright.neutralVSirregular",
+                                       "diff.inverted.angryVSneutral",
+                                       "diff.inverted.angryVSirregular",
+                                       "diff.inverted.neutralVSirregular"))
+  )
+
+# summary
+summary.pilot1.posterior.test <- pilot1.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(RTs),
+    hdi.95.low = hdi(RTs)[1],
+    hdi.95.high = hdi(RTs)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(RTs < 0)) / length(which(RTs > 0)),
+                            length(which(RTs > 0)) / length(which(RTs < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot1.posterior.test, digits = 2)
+
+### Paired comparisons ###
+
+par(mfrow = c(3, 3))
+
+for(i in 1:length(levels(pilot1.posterior.test$condition))) {
+  
+  temp.data <- filter(pilot1.posterior.test, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, RTs), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- irregular: slightly slower RTs for inverted compared to upright faces
+
+***
+***
+
+# Pilot 2
+
+* flickering frequency: 15 Hz 
+* regularity: 5 Hz
+* 2 face identities
+* task: detect dots on faces
+
+```{r pilot2_brms, eval = FALSE}
+
+# subset data
+behav.pilot2 <- behav.data %>%
+  filter(experiment == "pilot2")
+
+pilot2.model <- brm(RTs ~ 0 + condition
++ (0 + condition | participant),
+data = behav.pilot2,
+family = gaussian(),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "random",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(pilot2.model, file = "pilot2_model.rds", compress = "gzip")
+
+```
+
+```{r pilot2_model_diagnostics}
+
+# subset data
+behav.pilot2 <- behav.data %>%
+  filter(experiment == "pilot2")
+
+# load model
+pilot2.model <- readRDS("pilot2_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot2.model <-
+  describe_posterior(pilot2.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  mutate(
+    Parameter = gsub("b_condition", "", Parameter),
+    Parameter2 = gsub("_", " ", Parameter),
+    condition = factor(Parameter2,
+      levels =
+        c(
+          "upright angry high", "upright neutral high", "upright irregular high",
+          "upright angry low", "upright neutral low", "upright irregular low",
+          "inverted angry high", "inverted neutral high", "inverted irregular high",
+          "inverted angry low", "inverted neutral low", "inverted irregular low"
+        )
+    )
+  ) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot2.model, digits = 2)
+
+# MCMC chains
+pilot2.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "Chain" = ".chain",
+    "upright angry high" = "b_conditionupright_angry_high",
+    "upright neutral high" = "b_conditionupright_neutral_high",
+    "upright irregular high" = "b_conditionupright_irregular_high",
+    "upright angry low" = "b_conditionupright_angry_low",
+    "upright neutral low" = "b_conditionupright_neutral_low",
+    "upright irregular low" = "b_conditionupright_irregular_low",
+    "inverted angry high" = "b_conditioninverted_angry_high",
+    "inverted neutral high" = "b_conditioninverted_neutral_high",
+    "inverted irregular high" = "b_conditioninverted_irregular_high",
+    "inverted angry low" = "b_conditioninverted_angry_low",
+    "inverted neutral low" = "b_conditioninverted_neutral_low",
+    "inverted irregular low" = "b_conditioninverted_irregular_low"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 3)) +
+  geom_vline(
+    xintercept = seq(0, 2000, 500),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  ggtitle("chain convergence") +
+  theme_EmoSSR
+
+# posterior predictive checks
+pilot2.model %>%
+  posterior_predict(draws = 500) %>%
+  ppc_stat_grouped(
+    y = pull(behav.pilot2, RTs),
+    group = pull(behav.pilot2, condition),
+    stat = "mean"
+  ) +
+  ggtitle("posterior predictive checks") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+# posterior densities
+pilot2.model %>%
+  gather_draws(`b_.*`, regex = TRUE) %>%
+  mutate(condition = recode(factor(.variable),
+    "b_conditionupright_angry_high" = "upright angry high",
+    "b_conditionupright_neutral_high" = "upright neutral high",
+    "b_conditionupright_irregular_high" = "upright irregular high",
+    "b_conditionupright_angry_low" = "upright angry low",
+    "b_conditionupright_neutral_low" = "upright neutral low",
+    "b_conditionupright_irregular_low" = "upright irregular low",
+    "b_conditioninverted_angry_high" = "inverted angry high",
+    "b_conditioninverted_neutral_high" = "inverted neutral high",
+    "b_conditioninverted_irregular_high" = "inverted irregular high",
+    "b_conditioninverted_angry_low" = "inverted angry low",
+    "b_conditioninverted_neutral_low" = "inverted neutral low",
+     "b_conditioninverted_irregular_low" = "inverted irregular low"
+  )) %>%
+  dplyr::select(condition, RTs = .value) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+          "upright angry high", "upright neutral high", "upright irregular high",
+          "upright angry low", "upright neutral low", "upright irregular low",
+          "inverted angry high", "inverted neutral high", "inverted irregular high",
+          "inverted angry low", "inverted neutral low", "inverted irregular low"
+    )
+  )) %>%
+  ggplot(aes(y = condition, x = RTs)) +
+  geom_halfeyeh(fill = "#b3cde0", .width = .95) +
+  ggtitle("posterior densities") +
+  theme_minimal(base_size = 18) +
+  theme(
+    strip.text = element_text(
+      hjust = .5,
+      size = 24
+    ),
+    plot.title = element_text(size = 22, hjust = .5)
+  )
+
+### observed vs. predicted data ###
+behav.pilot2 %>%
+  mutate(predicted = predict(pilot2.model)[, 1]) %>%
+  dplyr::rename(observed = RTs) %>%
+  gather(key = data_type, value = RTs, observed:predicted) %>%
+  ggplot(aes(
+    x = cond4plot,
+    y = RTs,
+    color = variability,
+    fill = variability
+  )) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = TRUE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(
+    limits = c(0, 800),
+    breaks = seq(0, 800, 100)
+  ) +
+  coord_cartesian(ylim = c(200, 800)) +
+  geom_hline(
+    yintercept = seq(0, 800, 100),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  labs(
+    x = "",
+    y = "ms"
+  ) +
+  facet_wrap(~ data_type, scales = "free") +
+  ggtitle("pilot 2") +
+  theme_EmoSSR
+
+```
+
+```{r pilot2_hypothesis_testing}
+
+pilot2.posterior.test <- pilot2.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "upright angry high" = "b_conditionupright_angry_high",
+    "upright neutral high" = "b_conditionupright_neutral_high",
+    "upright irregular high" = "b_conditionupright_irregular_high",
+    "upright angry low" = "b_conditionupright_angry_low",
+    "upright neutral low" = "b_conditionupright_neutral_low",
+    "upright irregular low" = "b_conditionupright_irregular_low",
+    "inverted angry high" = "b_conditioninverted_angry_high",
+    "inverted neutral high" = "b_conditioninverted_neutral_high",
+    "inverted irregular high" = "b_conditioninverted_irregular_high",
+    "inverted angry low" = "b_conditioninverted_angry_low",
+    "inverted neutral low" = "b_conditioninverted_neutral_low",
+    "inverted irregular low" = "b_conditioninverted_irregular_low"
+  ) %>%
+  mutate(
+    ### orientation
+    # angry high
+    diff.high.angry.uprightVSinverted = `upright angry high` - `inverted angry high`,
+    # neutral high
+    diff.high.neutral.uprightVSinverted = `upright neutral high` - `inverted neutral high`,
+    # irregular high
+    diff.high.irregular.uprightVSinverted = `upright irregular high` - `inverted irregular high`,
+    # angry low
+    diff.low.angry.uprightVSinverted = `upright angry low` - `inverted angry low`,
+    # neutral high
+    diff.low.neutral.uprightVSinverted = `upright neutral low` - `inverted neutral low`,
+    # irregular high
+    diff.low.irregular.uprightVSinverted = `upright irregular low` - `inverted irregular low`,
+    ### regularity
+    ## upright high
+    # angry minus neutral
+    diff.high.upright.angryVSneutral = `upright angry high` - `upright neutral high`,
+    # angry minus irregular
+    diff.high.upright.angryVSirregular = `upright angry high` - `upright irregular high`,
+    # neutral minus irregular
+    diff.high.upright.neutralVSirregular = `upright neutral high` - `upright irregular high`,
+    ## upright low
+    # angry minus neutral
+    diff.low.upright.angryVSneutral = `upright angry low` - `upright neutral low`,
+    # angry minus irregular
+    diff.low.upright.angryVSirregular = `upright angry low` - `upright irregular low`,
+    # neutral minus irregular
+    diff.low.upright.neutralVSirregular = `upright neutral low` - `upright irregular low`,
+    ## inverted high
+    # angry minus neutral
+    diff.high.inverted.angryVSneutral = `inverted angry high` - `inverted neutral high`,
+    # angry minus irregular
+    diff.high.inverted.angryVSirregular = `inverted angry high` - `inverted irregular high`,
+    # neutral minus irregular
+    diff.high.inverted.neutralVSirregular = `inverted neutral high` - `inverted irregular high`,
+    ## inverted low
+    # angry minus neutral
+    diff.low.inverted.angryVSneutral = `inverted angry low` - `inverted neutral low`,
+    # angry minus irregular
+    diff.low.inverted.angryVSirregular = `inverted angry low` - `inverted irregular low`,
+    # neutral minus irregular
+    diff.low.inverted.neutralVSirregular = `inverted neutral low` - `inverted irregular low`,
+    ### variability
+    ## upright angry
+    diff.upright.angry.highVSlow = `upright angry high` - `upright angry low`,
+    ## upright neutral
+    diff.upright.neutral.highVSlow = `upright neutral high` - `upright neutral low`,
+    ## upright irregular
+    diff.upright.irregular.highVSlow = `upright irregular high` - `upright irregular low`,
+    ## inverted angry
+    diff.inverted.angry.highVSlow = `inverted angry high` - `inverted angry low`,
+    ## inverted neutral
+    diff.inverted.neutral.highVSlow = `inverted neutral high` - `inverted neutral low`,
+    ## inverted irregular
+    diff.inverted.irregular.highVSlow = `inverted irregular high` - `inverted irregular low`
+  ) %>%
+  gather(key = "condition", value = "RTs") %>%
+  filter(condition == c(
+    "diff.high.angry.uprightVSinverted",
+    "diff.high.neutral.uprightVSinverted",
+    "diff.high.irregular.uprightVSinverted",
+    "diff.low.angry.uprightVSinverted",
+    "diff.low.neutral.uprightVSinverted",
+    "diff.low.irregular.uprightVSinverted",
+    "diff.high.upright.angryVSneutral",
+    "diff.high.upright.angryVSirregular",
+    "diff.high.upright.neutralVSirregular",
+    "diff.low.upright.angryVSneutral",
+    "diff.low.upright.angryVSirregular",
+    "diff.low.upright.neutralVSirregular",
+    "diff.high.inverted.angryVSneutral",
+    "diff.high.inverted.angryVSirregular",
+    "diff.high.inverted.neutralVSirregular",
+    "diff.low.inverted.angryVSneutral",
+    "diff.low.inverted.angryVSirregular",
+    "diff.low.inverted.neutralVSirregular",
+    "diff.upright.angry.highVSlow",
+    "diff.upright.neutral.highVSlow",
+    "diff.upright.irregular.highVSlow",
+    "diff.inverted.angry.highVSlow",
+    "diff.inverted.neutral.highVSlow",
+    "diff.inverted.irregular.highVSlow"
+  )) %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.angry.uprightVSinverted",
+      "diff.high.neutral.uprightVSinverted",
+      "diff.high.irregular.uprightVSinverted",
+      "diff.low.angry.uprightVSinverted",
+      "diff.low.neutral.uprightVSinverted",
+      "diff.low.irregular.uprightVSinverted",
+      "diff.high.upright.angryVSneutral",
+      "diff.high.upright.angryVSirregular",
+      "diff.high.upright.neutralVSirregular",
+      "diff.low.upright.angryVSneutral",
+      "diff.low.upright.angryVSirregular",
+      "diff.low.upright.neutralVSirregular",
+      "diff.high.inverted.angryVSneutral",
+      "diff.high.inverted.angryVSirregular",
+      "diff.high.inverted.neutralVSirregular",
+      "diff.low.inverted.angryVSneutral",
+      "diff.low.inverted.angryVSirregular",
+      "diff.low.inverted.neutralVSirregular",
+      "diff.upright.angry.highVSlow",
+      "diff.upright.neutral.highVSlow",
+      "diff.upright.irregular.highVSlow",
+      "diff.inverted.angry.highVSlow",
+      "diff.inverted.neutral.highVSlow",
+      "diff.inverted.irregular.highVSlow"
+    )
+  ))
+
+# summary
+summary.pilot2.posterior.test <- pilot2.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(RTs),
+    hdi.95.low = hdi(RTs)[1],
+    hdi.95.high = hdi(RTs)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(RTs < 0)) / length(which(RTs > 0)),
+                            length(which(RTs > 0)) / length(which(RTs < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot2.posterior.test, digits = 2)
+
+### Paired comparisons ###
+
+### orientation
+pilot2.posterior.test.orientation <- filter(
+  pilot2.posterior.test,
+  condition == c(
+    "diff.high.angry.uprightVSinverted",
+    "diff.high.neutral.uprightVSinverted",
+    "diff.high.irregular.uprightVSinverted",
+    "diff.low.angry.uprightVSinverted",
+    "diff.low.neutral.uprightVSinverted",
+    "diff.low.irregular.uprightVSinverted"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 3))
+
+for (i in 1:length(levels(pilot2.posterior.test.orientation$condition))) {
+  temp.data <- filter(pilot2.posterior.test.orientation, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, RTs),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+### regularity
+pilot2.posterior.test.regularity <- filter(
+  pilot2.posterior.test,
+  condition == c(
+    "diff.high.upright.angryVSneutral",
+    "diff.high.upright.angryVSirregular",
+    "diff.high.upright.neutralVSirregular",
+    "diff.low.upright.angryVSneutral",
+    "diff.low.upright.angryVSirregular",
+    "diff.low.upright.neutralVSirregular",
+    "diff.high.inverted.angryVSneutral",
+    "diff.high.inverted.angryVSirregular",
+    "diff.high.inverted.neutralVSirregular",
+    "diff.low.inverted.angryVSneutral",
+    "diff.low.inverted.angryVSirregular",
+    "diff.low.inverted.neutralVSirregular"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(4, 3))
+
+for (i in 1:length(levels(pilot2.posterior.test.regularity$condition))) {
+  temp.data <- filter(pilot2.posterior.test.regularity, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, RTs),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+### variability
+pilot2.posterior.test.variability <- filter(
+  pilot2.posterior.test,
+  condition == c(
+    "diff.upright.angry.highVSlow",
+    "diff.upright.neutral.highVSlow",
+    "diff.upright.irregular.highVSlow",
+    "diff.inverted.angry.highVSlow",
+    "diff.inverted.neutral.highVSlow",
+    "diff.inverted.irregular.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 3))
+
+for (i in 1:length(levels(pilot2.posterior.test.variability$condition))) {
+  temp.data <- filter(pilot2.posterior.test.variability, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, RTs),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+```
+
+## Take-home message:
+
+- paired comparisons:
+    - orientation
+        - slower RTs for inverted compared to upright irregular faces when within-identity emotion variability is low
+    - regularity
+        - slightly slower RTs for angry compared to neutral inverted faces when within-identity emotion variability is low
+        - slower RTs for irregular compared to neutral inverted faces when within-identity emotion variability is low
+    - within-identity emotion variability        
+        - upright neutral: slower RTs for high compared to low within-identity emotion variability
+        - upright irregular: slightly slower RTs for high compared to low within-identity emotion variability
+
+***
+***
+
+# Exp 1
+
+* flickering frequency: 6 Hz 
+* regularity: 2 Hz
+* 2 face identities
+* task: detect dots on faces
+
+```{r exp1_brms, eval = FALSE}
+
+# subset data
+behav.exp1 <- behav.data %>%
+  filter(experiment == "exp1")
+
+exp1.model <- brm(RTs ~ 0 + condition
++ (0 + condition | participant),
+data = behav.exp1,
+family = gaussian(),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "random",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp1.model, file = "exp1_model.rds", compress = "gzip")
+
+```
+
+```{r exp1_model_diagnostics}
+
+# subset data
+behav.exp1 <- behav.data %>%
+  filter(experiment == "exp1")
+
+# load model
+exp1.model <- readRDS("exp1_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp1.model <-
+  describe_posterior(exp1.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  mutate(
+    Parameter = gsub("b_condition", "", Parameter),
+    Parameter2 = gsub("_", " ", Parameter),
+    condition = factor(Parameter2,
+      levels =
+        c(
+          "upright angry high", "upright neutral high", "upright irregular high",
+          "upright angry low", "upright neutral low", "upright irregular low",
+          "inverted angry high", "inverted neutral high", "inverted irregular high",
+          "inverted angry low", "inverted neutral low", "inverted irregular low"
+        )
+    )
+  ) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp1.model, digits = 2)
+
+# MCMC chains
+exp1.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "Chain" = ".chain",
+    "upright angry high" = "b_conditionupright_angry_high",
+    "upright neutral high" = "b_conditionupright_neutral_high",
+    "upright irregular high" = "b_conditionupright_irregular_high",
+    "upright angry low" = "b_conditionupright_angry_low",
+    "upright neutral low" = "b_conditionupright_neutral_low",
+    "upright irregular low" = "b_conditionupright_irregular_low",
+    "inverted angry high" = "b_conditioninverted_angry_high",
+    "inverted neutral high" = "b_conditioninverted_neutral_high",
+    "inverted irregular high" = "b_conditioninverted_irregular_high",
+    "inverted angry low" = "b_conditioninverted_angry_low",
+    "inverted neutral low" = "b_conditioninverted_neutral_low",
+    "inverted irregular low" = "b_conditioninverted_irregular_low"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 3)) +
+  geom_vline(
+    xintercept = seq(0, 2000, 500),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  ggtitle("chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+# posterior predictive checks
+exp1.model %>%
+  posterior_predict(draws = 500) %>%
+  ppc_stat_grouped(
+    y = pull(behav.exp1, RTs),
+    group = pull(behav.exp1, condition),
+    stat = "mean"
+  ) +
+  ggtitle("posterior predictive checks") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+```
+
+```{r exp1_hypothesis_testing}
+
+exp1.posterior.test <- exp1.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "upright angry high" = "b_conditionupright_angry_high",
+    "upright neutral high" = "b_conditionupright_neutral_high",
+    "upright irregular high" = "b_conditionupright_irregular_high",
+    "upright angry low" = "b_conditionupright_angry_low",
+    "upright neutral low" = "b_conditionupright_neutral_low",
+    "upright irregular low" = "b_conditionupright_irregular_low",
+    "inverted angry high" = "b_conditioninverted_angry_high",
+    "inverted neutral high" = "b_conditioninverted_neutral_high",
+    "inverted irregular high" = "b_conditioninverted_irregular_high",
+    "inverted angry low" = "b_conditioninverted_angry_low",
+    "inverted neutral low" = "b_conditioninverted_neutral_low",
+    "inverted irregular low" = "b_conditioninverted_irregular_low"
+  ) %>%
+  mutate(
+    ### orientation
+    # angry high
+    diff.high.angry.uprightVSinverted = `upright angry high` - `inverted angry high`,
+    # neutral high
+    diff.high.neutral.uprightVSinverted = `upright neutral high` - `inverted neutral high`,
+    # irregular high
+    diff.high.irregular.uprightVSinverted = `upright irregular high` - `inverted irregular high`,
+    # angry low
+    diff.low.angry.uprightVSinverted = `upright angry low` - `inverted angry low`,
+    # neutral high
+    diff.low.neutral.uprightVSinverted = `upright neutral low` - `inverted neutral low`,
+    # irregular high
+    diff.low.irregular.uprightVSinverted = `upright irregular low` - `inverted irregular low`,
+    ### regularity
+    ## upright high
+    # angry minus neutral
+    diff.high.upright.angryVSneutral = `upright angry high` - `upright neutral high`,
+    # angry minus irregular
+    diff.high.upright.angryVSirregular = `upright angry high` - `upright irregular high`,
+    # neutral minus irregular
+    diff.high.upright.neutralVSirregular = `upright neutral high` - `upright irregular high`,
+    ## upright low
+    # angry minus neutral
+    diff.low.upright.angryVSneutral = `upright angry low` - `upright neutral low`,
+    # angry minus irregular
+    diff.low.upright.angryVSirregular = `upright angry low` - `upright irregular low`,
+    # neutral minus irregular
+    diff.low.upright.neutralVSirregular = `upright neutral low` - `upright irregular low`,
+    ## inverted high
+    # angry minus neutral
+    diff.high.inverted.angryVSneutral = `inverted angry high` - `inverted neutral high`,
+    # angry minus irregular
+    diff.high.inverted.angryVSirregular = `inverted angry high` - `inverted irregular high`,
+    # neutral minus irregular
+    diff.high.inverted.neutralVSirregular = `inverted neutral high` - `inverted irregular high`,
+    ## inverted low
+    # angry minus neutral
+    diff.low.inverted.angryVSneutral = `inverted angry low` - `inverted neutral low`,
+    # angry minus irregular
+    diff.low.inverted.angryVSirregular = `inverted angry low` - `inverted irregular low`,
+    # neutral minus irregular
+    diff.low.inverted.neutralVSirregular = `inverted neutral low` - `inverted irregular low`,
+    ### variability
+    ## upright angry
+    diff.upright.angry.highVSlow = `upright angry high` - `upright angry low`,
+    ## upright neutral
+    diff.upright.neutral.highVSlow = `upright neutral high` - `upright neutral low`,
+    ## upright irregular
+    diff.upright.irregular.highVSlow = `upright irregular high` - `upright irregular low`,
+    ## inverted angry
+    diff.inverted.angry.highVSlow = `inverted angry high` - `inverted angry low`,
+    ## inverted neutral
+    diff.inverted.neutral.highVSlow = `inverted neutral high` - `inverted neutral low`,
+    ## inverted irregular
+    diff.inverted.irregular.highVSlow = `inverted irregular high` - `inverted irregular low`
+  ) %>%
+  gather(key = "condition", value = "RTs") %>%
+  filter(condition == c(
+    "diff.high.angry.uprightVSinverted",
+    "diff.high.neutral.uprightVSinverted",
+    "diff.high.irregular.uprightVSinverted",
+    "diff.low.angry.uprightVSinverted",
+    "diff.low.neutral.uprightVSinverted",
+    "diff.low.irregular.uprightVSinverted",
+    "diff.high.upright.angryVSneutral",
+    "diff.high.upright.angryVSirregular",
+    "diff.high.upright.neutralVSirregular",
+    "diff.low.upright.angryVSneutral",
+    "diff.low.upright.angryVSirregular",
+    "diff.low.upright.neutralVSirregular",
+    "diff.high.inverted.angryVSneutral",
+    "diff.high.inverted.angryVSirregular",
+    "diff.high.inverted.neutralVSirregular",
+    "diff.low.inverted.angryVSneutral",
+    "diff.low.inverted.angryVSirregular",
+    "diff.low.inverted.neutralVSirregular",
+    "diff.upright.angry.highVSlow",
+    "diff.upright.neutral.highVSlow",
+    "diff.upright.irregular.highVSlow",
+    "diff.inverted.angry.highVSlow",
+    "diff.inverted.neutral.highVSlow",
+    "diff.inverted.irregular.highVSlow"
+  )) %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.angry.uprightVSinverted",
+      "diff.high.neutral.uprightVSinverted",
+      "diff.high.irregular.uprightVSinverted",
+      "diff.low.angry.uprightVSinverted",
+      "diff.low.neutral.uprightVSinverted",
+      "diff.low.irregular.uprightVSinverted",
+      "diff.high.upright.angryVSneutral",
+      "diff.high.upright.angryVSirregular",
+      "diff.high.upright.neutralVSirregular",
+      "diff.low.upright.angryVSneutral",
+      "diff.low.upright.angryVSirregular",
+      "diff.low.upright.neutralVSirregular",
+      "diff.high.inverted.angryVSneutral",
+      "diff.high.inverted.angryVSirregular",
+      "diff.high.inverted.neutralVSirregular",
+      "diff.low.inverted.angryVSneutral",
+      "diff.low.inverted.angryVSirregular",
+      "diff.low.inverted.neutralVSirregular",
+      "diff.upright.angry.highVSlow",
+      "diff.upright.neutral.highVSlow",
+      "diff.upright.irregular.highVSlow",
+      "diff.inverted.angry.highVSlow",
+      "diff.inverted.neutral.highVSlow",
+      "diff.inverted.irregular.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp1.posterior.test <- exp1.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(RTs),
+    hdi.95.low = hdi(RTs)[1],
+    hdi.95.high = hdi(RTs)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(RTs < 0)) / length(which(RTs > 0)),
+                            length(which(RTs > 0)) / length(which(RTs < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp1.posterior.test, digits = 2)
+
+### Paired comparisons ###
+
+### orientation
+exp1.posterior.test.orientation <- filter(
+  exp1.posterior.test,
+  condition == c(
+    "diff.high.angry.uprightVSinverted",
+    "diff.high.neutral.uprightVSinverted",
+    "diff.high.irregular.uprightVSinverted",
+    "diff.low.angry.uprightVSinverted",
+    "diff.low.neutral.uprightVSinverted",
+    "diff.low.irregular.uprightVSinverted"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 3))
+
+for (i in 1:length(levels(exp1.posterior.test.orientation$condition))) {
+  temp.data <- filter(exp1.posterior.test.orientation, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, RTs),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+### regularity
+exp1.posterior.test.regularity <- filter(
+  exp1.posterior.test,
+  condition == c(
+    "diff.high.upright.angryVSneutral",
+    "diff.high.upright.angryVSirregular",
+    "diff.high.upright.neutralVSirregular",
+    "diff.low.upright.angryVSneutral",
+    "diff.low.upright.angryVSirregular",
+    "diff.low.upright.neutralVSirregular",
+    "diff.high.inverted.angryVSneutral",
+    "diff.high.inverted.angryVSirregular",
+    "diff.high.inverted.neutralVSirregular",
+    "diff.low.inverted.angryVSneutral",
+    "diff.low.inverted.angryVSirregular",
+    "diff.low.inverted.neutralVSirregular"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(4, 3))
+
+for (i in 1:length(levels(exp1.posterior.test.regularity$condition))) {
+  temp.data <- filter(exp1.posterior.test.regularity, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, RTs),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+### variability
+exp1.posterior.test.variability <- filter(
+  exp1.posterior.test,
+  condition == c(
+    "diff.upright.angry.highVSlow",
+    "diff.upright.neutral.highVSlow",
+    "diff.upright.irregular.highVSlow",
+    "diff.inverted.angry.highVSlow",
+    "diff.inverted.neutral.highVSlow",
+    "diff.inverted.irregular.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 3))
+
+for (i in 1:length(levels(exp1.posterior.test.variability$condition))) {
+  temp.data <- filter(exp1.posterior.test.variability, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, RTs),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+```
+
+## Take-home message:
+
+- paired comparisons:
+    - orientation
+        - slightly slower RTs for inverted compared to upright neutral faces when within-identity emotion variability is low
+        - slightly slower RTs for inverted compared to upright irregular faces when within-identity emotion variability is low
+    - regularity
+        - slower RTs for irregular compared to angry upright faces when within-identity emotion variability is high
+        - slightly slower RTs for irregular compared to neutral upright faces when within-identity emotion variability is high
+        - slower RTs for neutral compared to angry inverted faces when within-identity emotion variability is low
+        - slightly slower RTs for irregular compared to angry inverted faces when within-identity emotion variability is low
+    - within-identity emotion variability        
+        - upright irregular: slower RTs for high compared to low within-identity emotion variability
+        - inverted angry: slightly slower RTs for high compared to low within-identity emotion variability
+        
+***
+***
