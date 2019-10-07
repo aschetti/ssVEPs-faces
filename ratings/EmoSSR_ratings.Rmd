@@ -1,0 +1,3356 @@
+---
+title: "EmoSSR: face ratings"
+author: '[Antonio Schettino](https://osf.io/zbv65/ "Antonio Schettino")'
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    code_folding: hide
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup_environment, echo = FALSE, warning = FALSE, message = FALSE}
+
+### install packages
+# install.packages(c("knitr",
+#                    "tidyverse", "Rmisc",
+#                    "parallel", "rstan", "brms",
+#                    "bayesplot", "tidybayes", "bayestestR", "BEST", "viridis", "cowplot"),
+#                  dependencies = TRUE)
+# devtools::install_github("mikabr/ggpirate", dependencies = TRUE)
+
+### load packages
+# document
+library(knitr)
+# data manipulation
+library(tidyverse)
+library(Rmisc)
+# data analysis
+library(parallel)
+library(rstan)
+library(brms)
+# summary and plotting
+library(bayesplot)
+library(tidybayes)
+library(bayestestR)
+library(BEST)
+library(viridis)
+library(ggpirate)
+library(cowplot)
+
+# for RMarkdown
+options(
+  digits = 4, # number of digits
+  width = 120, # output width
+  scipen = 999 # disable scientific notation (default: scipen = 0)
+)
+opts_chunk$set(
+  warning = FALSE, # no package warnings
+  message = FALSE, # no package messages
+  fig.width = 18, # figure width
+  fig.height = 9 # figure height
+)
+
+# ggplot custom theme
+theme_EmoSSR <- theme_minimal(base_size = 18) +
+  theme(
+    strip.text = element_text(
+      hjust = .5,
+      size = 24
+    ),
+    panel.grid = element_blank(),
+    # legend.title = element_blank(),
+    legend.box.background = element_rect(color = "transparent"),
+    plot.title = element_text(size = 22, hjust = .5)
+  )
+
+# viridis color palette for plots Bayes
+color_scheme_set("viridis")
+
+seed.smorfia <- 12 # 'e surdate
+set.seed(seed.smorfia) # seed for random number generation
+
+# setup for STAN
+rstan_options(auto_write = TRUE) # avoid recompilation of unchanged models
+options(mc.cores = parallel::detectCores())
+num.cores <- 8 # number of cores in processor of computer used for analysis (parallel::detectCores())
+num.chains <- num.cores # number of chains = number of cores in processor of computer used for analysis
+num.iter <- 8000 # number of samples per chain
+num.warmup <- 4000 # number of warm-up samples per chain
+num.thin <- 2 # thinning: extract one out of x samples per chain
+weak.priors <- c( # weakly informative priors...
+  set_prior("normal(0, 3)", class = "b"), # ... on beta coefficients
+  set_prior("student_t(3, 0, 2)", class = "sd") # ... on SD of varying effects
+)
+
+```
+
+Here we assess whether the faces used in the experiments conveyed the intended emotional expression.
+
+```{r tidy_data}
+
+# setwd(paste0(getwd(), "/ratings")) # set working subdir
+
+# pilot1 must be treated separately because it used different faces
+pilot1 <- read_csv("pilot1_ratings.csv") %>%
+  mutate(
+    exp = "pilot1",
+    participant = as.factor(subject),
+    question = as.factor(question),
+    emotion = factor(substr(pic_id, 1, 1), labels = c("anger", "neutral", "happiness")),
+    picID = as.factor(substr(pic_id, 2, 2))
+  ) %>%
+  dplyr::select(exp, participant, question, picID, emotion, ratings = "rating")
+
+exps <- c( # variable with experiment identifier
+  # participants x picID x question
+  rep(sub("_ratings.csv", "", list.files(pattern = ".csv")[1]), each = (30 * 8 * 3)),
+  rep(sub("_ratings.csv", "", list.files(pattern = ".csv")[2]), each = (30 * 8 * 3)),
+  rep(sub("_ratings.csv", "", list.files(pattern = ".csv")[4]), each = (16 * 8 * 3))
+)
+
+ratings <- list.files(pattern = ".csv")[c(1, 2, 4)] %>% # list of csv files in current directory (excluding pilot1)
+  map_df(~ read_csv(.)) %>%
+  mutate(
+    exp = as.factor(exps),
+    participant = as.factor(subject),
+    question = as.factor(question),
+    picID = as.factor(pic_id),
+    emotion = case_when(
+      picID == "1" | picID == "5" ~ "anger",
+      picID == "2" | picID == "10" ~ "neutral",
+      picID == "3" | picID == "15" ~ "happiness",
+      picID == "4" | picID == "20" ~ "disgust"
+    )
+  ) %>%
+  dplyr::select(exp, participant, question, picID, emotion, ratings = "rating") %>%
+  bind_rows(., pilot1) %>%
+  mutate(
+    variability = case_when(
+      exp != "pilot1" & picID == "1" |
+        exp != "pilot1" & picID == "2" |
+        exp != "pilot1" & picID == "3" |
+        exp != "pilot1" & picID == "4" ~ "low",
+      exp != "pilot1" & picID == "5" |
+        exp != "pilot1" & picID == "10" |
+        exp != "pilot1" & picID == "15" |
+        exp != "pilot1" & picID == "20" ~ "high",
+      exp == "pilot1" ~ "NA"
+    )
+  ) %>%
+  unite(condition, c(emotion, variability), sep = "_", remove = FALSE) %>%
+  mutate(
+    exp = factor(exp,
+      levels = c("pilot1", "pilot2", "exp1", "exp2") # sort pilots first
+    ),
+    condition = recode(factor(condition),
+      "anger_low" = "anger, low variability",
+      "neutral_low" = "neutral, low variability",
+      "happiness_low" = "happiness, low variability",
+      "disgust_low" = "disgust, low variability",
+      "anger_high" = "anger, high variability",
+      "neutral_high" = "neutral, high variability",
+      "happiness_high" = "happiness, high variability",
+      "disgust_high" = "disgust, high variability",
+      "anger_NA" = "anger",
+      "neutral_NA" = "neutral",
+      "happiness_NA" = "happiness"
+    )
+  ) %>%
+  dplyr::select(-picID)
+
+rm(pilot1)
+
+```
+
+Face ratings were collected at the end of all experiments. In *Pilot 1*, we used 9 identities and 2 emotional expressions, whereas in the other experiments we used 2 identities and 3 expressions (disgust as a filler, never regularly presented during trials).
+
+```{r summary_data}
+
+summary.ratings <- summarySEwithin(
+  data = ratings,
+  measurevar = "ratings",
+  betweenvars = "exp",
+  withinvars = c("condition", "question"),
+  idvar = "participant"
+) %>%
+  mutate(
+    CI.95.low = ratings - ci,
+    CI.95.high = ratings + ci
+  ) %>%
+  dplyr::select(exp, condition, question, ratings, CI.95.low, CI.95.high) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "neutral", "anger", "happiness",
+      "neutral, low variability", "anger, low variability", "happiness, low variability", "disgust, low variability", 
+      "neutral, high variability", "anger, high variability", "happiness, high variability", "disgust, high variability"
+    )
+  )) %>%
+  arrange(exp, question, condition)
+
+kable(summary.ratings, digits = 2)
+
+```
+
+```{r data_pirateplot}
+
+ratings.plot <- 
+  ggplot(
+    ratings,
+    aes(
+      x = question,
+      y = ratings,
+      color = emotion,
+      fill = emotion
+    )
+  ) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = TRUE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(
+    limits = c(1, 9),
+    breaks = seq(1, 9, 1)
+  ) +
+  geom_hline(
+    yintercept = seq(1, 9, 1),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  labs(
+    x = "question",
+    y = "ratings"
+  ) +
+  facet_wrap(~exp, scales = "free") +
+  theme_EmoSSR
+
+ratings.plot
+
+# ### save plots to file
+# # all plots in one figure
+# save_plot(paste0(getwd(), "/ratings.svg"),
+#           ratings.plot,
+#           base_aspect_ratio = 1,
+#           base_height = 11,
+#           base_width = 17
+#           )
+
+```
+
+For the statistical analyses, we will fit Bayesian multilevel models using `brms`, separately for each question. The constant effect will be **emotion**. Intercepts and slopes will be allowed to vary as a function of *participant* and *picID*.
+
+# Pilot 1
+
+* 9 face identities 
+* 2 emotions (anger, happiness)
+
+## How ANGRY are these faces?
+
+```{r pilot1_Qangry_brms, eval = FALSE}
+
+# subset data
+pilot1.Qangry.ratings <- ratings %>%
+  dplyr::select(-c(variability, emotion)) %>%
+  filter(exp == "pilot1", question == "angry") %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+    levels = c("anger", "neutral", "happiness") # sort anger first
+  ))
+
+pilot1.Qangry.model <- brm(ratings ~ condition # constant effects
++ (condition | participant), # varying effects
+data = pilot1.Qangry.ratings, # subset data
+family = cumulative("probit"), # likelihood function
+prior = weak.priors, # priors
+sample_prior = TRUE, # draw samples from the prior distribution
+inits = "0", # initial parameter values in the chains
+control = list(
+  adapt_delta = .99, # parameters of NUTS sampler
+  max_treedepth = 15
+),
+chains = num.chains, # number of chains
+iter = num.iter, # number of iterations
+warmup = num.warmup, # number of warm-up samples
+thin = num.thin, # thinning rate
+algorithm = "sampling", # type of sampling algorithm
+cores = num.chains, # number of processor cores to use when running chains in parallel
+seed = seed.smorfia # RNG seed
+)
+
+saveRDS(pilot1.Qangry.model, file = "pilot1_Qangry_model.rds", compress = "gzip") # save results
+
+```
+
+```{r pilot1_Qangry_model_diagnostics}
+
+# subset data
+pilot1.Qangry.ratings <- ratings %>%
+  dplyr::select(-c(variability, emotion)) %>%
+  filter(exp == "pilot1", question == "angry") %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+    levels = c("anger", "neutral", "happiness") # sort anger first
+  ))
+
+# load model
+pilot1.Qangry.model <- readRDS("pilot1_Qangry_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot1.Qangry.model <-
+  describe_posterior(pilot1.Qangry.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "conditionneutral" = "anger minus neutral",
+    "conditionhappiness" = "anger minus happiness"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot1.Qangry.model, digits = 2)
+
+# MCMC chains
+pilot1.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "Chain" = ".chain",
+    "Intercept[1]" = "b_Intercept[1]",
+    "Intercept[2]" = "b_Intercept[2]",
+    "Intercept[3]" = "b_Intercept[3]",
+    "Intercept[4]" = "b_Intercept[4]",
+    "Intercept[5]" = "b_Intercept[5]",
+    "Intercept[6]" = "b_Intercept[6]",
+    "Intercept[7]" = "b_Intercept[7]",
+    "Intercept[8]" = "b_Intercept[8]",
+    "anger minus neutral" = "b_conditionneutral",
+    "anger minus happiness" = "b_conditionhappiness"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(
+    xintercept = seq(1, 9, 1),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+pilot1.Qangry.ratings %>%
+  mutate(predicted = posterior_predict(pilot1.Qangry.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(
+    x = condition,
+    y = ratings,
+    color = condition,
+    fill = condition
+  )) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(
+    limits = c(1, 9),
+    breaks = seq(1, 9, 1)
+  ) +
+  geom_hline(
+    yintercept = seq(1, 9, 1),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  facet_wrap(~data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 1, \"anger\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r pilot1_Qangry_hypothesis_testing}
+
+pilot1.Qangry.posterior.test <- pilot1.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger minus neutral" = "b_conditionneutral",
+    "anger minus happiness" = "b_conditionhappiness"
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  mutate(condition = as.factor(condition))
+
+# summary
+summary.pilot1.Qangry.posterior.test <- pilot1.Qangry.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0,
+      length(which(ratings < 0)) / length(which(ratings > 0)),
+      length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot1.Qangry.posterior.test, digits = 2)
+
+par(mfrow = c(1, 2))
+
+for (i in 1:length(levels(pilot1.Qangry.posterior.test$condition))) {
+  temp.data <- filter(pilot1.Qangry.posterior.test, condition == levels(condition)[i])
+
+  plotPost(
+    pull(temp.data, ratings),
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "",
+    col = "#b3cde0",
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+}
+
+```
+
+## Take-home message:
+
+- happy and neutral faces are rated as less angry than angry faces
+
+## How HAPPY are these faces?
+
+```{r pilot1_Qhappy_brms, eval = FALSE}
+
+# subset data
+pilot1.Qhappy.ratings <- ratings %>%
+  dplyr::select(-c(variability, emotion)) %>%
+  filter(exp == "pilot1", question == "happy") %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+    levels = c("happiness", "neutral", "anger") # sort happiness first
+  ))
+
+pilot1.Qhappy.model <- brm(ratings ~ condition
++ (condition | participant),
+data = pilot1.Qhappy.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(pilot1.Qhappy.model, file = "pilot1_Qhappy_model.rds", compress = "gzip")
+
+```
+
+```{r pilot1_Qhappy_model_diagnostics}
+
+# subset data
+pilot1.Qhappy.ratings <- ratings %>%
+  dplyr::select(-c(variability, emotion)) %>%
+  filter(exp == "pilot1", question == "happy") %>%
+  droplevels() %>%
+  mutate(condition = factor(condition,
+    levels = c("happiness", "neutral", "anger") # sort happiness first
+  ))
+
+# load model
+pilot1.Qhappy.model <- readRDS("pilot1_Qhappy_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot1.Qhappy.model <-
+  describe_posterior(pilot1.Qhappy.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "conditionneutral" = "happiness minus neutral",
+    "conditionanger" = "happiness minus anger"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot1.Qhappy.model, digits = 2)
+
+# MCMC chains
+pilot1.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "happiness minus neutral" = "b_conditionneutral",
+                "happiness minus anger" = "b_conditionanger"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(
+    xintercept = seq(1, 9, 1),
+    linetype = "dotted",
+    colour = "#999999",
+    size = .8,
+    alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+pilot1.Qhappy.ratings %>%
+  mutate(predicted = posterior_predict(pilot1.Qhappy.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 1, \"happiness\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r pilot1_Qhappy_hypothesis_testing}
+
+pilot1.Qhappy.posterior.test <- pilot1.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("happiness minus neutral" = "b_conditionneutral",
+                "happiness minus anger" = "b_conditionanger"
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  mutate(condition = as.factor(condition))
+
+# summary
+summary.pilot1.Qhappy.posterior.test <- pilot1.Qhappy.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot1.Qhappy.posterior.test, digits = 2)
+
+par(mfrow = c(1, 2))
+
+for(i in 1:length(levels(pilot1.Qhappy.posterior.test$condition))) {
+  
+  temp.data <- filter(pilot1.Qhappy.posterior.test, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- angry and neutral faces are rated as less happy than happy faces
+
+***
+***
+
+# Pilot 2
+
+* 2 face identities 
+* 3 emotions (anger, happiness, disgust)
+
+## How ANGRY are these faces?
+
+```{r pilot2_Qangry_brms, eval = FALSE}
+
+# subset data
+pilot2.Qangry.ratings <- ratings %>%
+  filter(exp == "pilot2", question == "angry") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("anger", "neutral", "happiness", "disgust") # sort anger first
+  ))
+
+pilot2.Qangry.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = pilot2.Qangry.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(pilot2.Qangry.model, file = "pilot2_Qangry_model.rds", compress = "gzip")
+
+```
+
+```{r pilot2_Qangry_model_diagnostics}
+
+# subset data
+pilot2.Qangry.ratings <- ratings %>%
+  filter(exp == "pilot2", question == "angry") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("anger", "neutral", "happiness", "disgust") # sort anger first
+  ))
+
+# load model
+pilot2.Qangry.model <- readRDS("pilot2_Qangry_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot2.Qangry.model <-
+  describe_posterior(pilot2.Qangry.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot2.Qangry.model, digits = 2)
+
+# MCMC chains
+pilot2.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+pilot2.Qangry.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(pilot2.Qangry.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 2, \"anger\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r pilot2_Qangry_hypothesis_testing}
+
+pilot2.Qangry.posterior.test <- pilot2.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (anger minus others)
+    ## high variability
+    # anger minus neutral
+    diff.high.angerVSneutral = `anger, high variability` - `neutral, high variability`,
+    # anger minus happiness
+    diff.high.angerVShappiness = `anger, high variability` - `happiness, high variability`,
+    # anger minus disgust
+    diff.high.angerVSdisgust = `anger, high variability` - `disgust, high variability`,
+    ## low variability
+    # anger minus neutral
+    diff.low.angerVSneutral = `anger, low variability` - `neutral, low variability`,
+    # anger minus happiness
+    diff.low.angerVShappiness = `anger, low variability` - `happiness, low variability`,
+    # anger minus disgust
+    diff.low.angerVSdisgust = `anger, low variability` - `disgust, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.angerVSneutral",
+    "diff.high.angerVShappiness",
+    "diff.high.angerVSdisgust",
+    "diff.low.angerVSneutral",
+    "diff.low.angerVShappiness",
+    "diff.low.angerVSdisgust",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.angerVSneutral", "diff.high.angerVShappiness", "diff.high.angerVSdisgust",
+      "diff.low.angerVSneutral", "diff.low.angerVShappiness", "diff.low.angerVSdisgust",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.pilot2.Qangry.posterior.test <- pilot2.Qangry.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot2.Qangry.posterior.test, digits = 2)
+
+### Anger vs. others ###
+
+pilot2.Qangry.posterior.test.emoref <- filter(
+  pilot2.Qangry.posterior.test,
+  condition == c(
+    "diff.high.angerVSneutral", "diff.high.angerVShappiness", "diff.high.angerVSdisgust",
+    "diff.low.angerVSneutral", "diff.low.angerVShappiness", "diff.low.angerVSdisgust"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(pilot2.Qangry.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(pilot2.Qangry.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+pilot2.Qangry.posterior.test.var <- filter(
+  pilot2.Qangry.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(pilot2.Qangry.posterior.test.var$condition))) {
+  
+  temp.data <- filter(pilot2.Qangry.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less angry than angry faces, in both within-emotion variabilities
+- angry and neutral faces are rated as angrier in high compared to low within-emotion variability
+- happy and disgusted faces are rated as similarly angry in high and low within-emotion variability
+
+***
+***
+
+## How HAPPY are these faces?
+
+```{r pilot2_Qhappy_brms, eval = FALSE}
+
+# subset data
+pilot2.Qhappy.ratings <- ratings %>%
+  filter(exp == "pilot2", question == "happy") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("happiness", "neutral", "anger", "disgust") # sort happiness first
+  ))
+
+pilot2.Qhappy.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = pilot2.Qhappy.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(pilot2.Qhappy.model, file = "pilot2_Qhappy_model.rds", compress = "gzip")
+
+```
+
+```{r pilot2_Qhappy_model_diagnostics}
+
+# subset data
+pilot2.Qhappy.ratings <- ratings %>%
+  filter(exp == "pilot2", question == "happy") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("happiness", "neutral", "anger", "disgust") # sort happiness first
+  ))
+
+# load model
+pilot2.Qhappy.model <- readRDS("pilot2_Qhappy_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot2.Qhappy.model <-
+  describe_posterior(pilot2.Qhappy.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot2.Qhappy.model, digits = 2)
+
+# MCMC chains
+pilot2.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+pilot2.Qhappy.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(pilot2.Qhappy.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 2, \"happiness\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r pilot2_Qhappy_hypothesis_testing}
+
+pilot2.Qhappy.posterior.test <- pilot2.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (happiness minus others)
+    ## high variability
+    # happiness minus neutral
+    diff.high.happinessVSneutral = `happiness, high variability` - `neutral, high variability`,
+    # happiness minus anger
+    diff.high.happinessVSanger = `happiness, high variability` - `anger, high variability`,
+    # happiness minus disgust
+    diff.high.happinessVSdisgust = `happiness, high variability` - `disgust, high variability`,
+    ## low variability
+    # happiness minus neutral
+    diff.low.happinessVSneutral = `happiness, low variability` - `neutral, low variability`,
+    # happiness minus anger
+    diff.low.happinessVSanger = `happiness, low variability` - `anger, low variability`,
+    # happiness minus disgust
+    diff.low.happinessVSdisgust = `happiness, low variability` - `disgust, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.happinessVSneutral",
+    "diff.high.happinessVSanger",
+    "diff.high.happinessVSdisgust",
+    "diff.low.happinessVSneutral",
+    "diff.low.happinessVSanger",
+    "diff.low.happinessVSdisgust",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.happinessVSneutral", "diff.high.happinessVSanger", "diff.high.happinessVSdisgust",
+      "diff.low.happinessVSneutral", "diff.low.happinessVSanger", "diff.low.happinessVSdisgust",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.pilot2.Qhappy.posterior.test <- pilot2.Qhappy.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot2.Qhappy.posterior.test, digits = 2)
+
+### Happiness vs. others ###
+
+pilot2.Qhappy.posterior.test.emoref <- filter(
+  pilot2.Qhappy.posterior.test,
+  condition == c(
+    "diff.high.happinessVSneutral", "diff.high.happinessVSanger", "diff.high.happinessVSdisgust",
+    "diff.low.happinessVSneutral", "diff.low.happinessVSanger", "diff.low.happinessVSdisgust"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(pilot2.Qhappy.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(pilot2.Qhappy.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+pilot2.Qhappy.posterior.test.var <- filter(
+  pilot2.Qhappy.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(pilot2.Qhappy.posterior.test.var$condition))) {
+  
+  temp.data <- filter(pilot2.Qhappy.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less happy than happy faces, in both within-emotion variabilities
+- angry, neutral, and disgusted faces are rated as happier in low compared to high within-emotion variability
+- happy faces are rated as similarly happy in high and low within-emotion variability
+
+***
+***
+
+## How DISGUSTED are these faces?
+
+```{r pilot2_Qdisgust_brms, eval = FALSE}
+
+# subset data
+pilot2.Qdisgust.ratings <- ratings %>%
+  filter(exp == "pilot2", question == "disgusted") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("disgust", "neutral", "anger", "happiness") # sort disgust first
+  ))
+
+pilot2.Qdisgust.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = pilot2.Qdisgust.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(pilot2.Qdisgust.model, file = "pilot2_Qdisgust_model.rds", compress = "gzip")
+
+```
+
+```{r pilot2_Qdisgust_model_diagnostics}
+
+# subset data
+pilot2.Qdisgust.ratings <- ratings %>%
+  filter(exp == "pilot2", question == "disgusted") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("disgust", "neutral", "anger", "happiness") # sort disgust first
+  ))
+
+# load model
+pilot2.Qdisgust.model <- readRDS("pilot2_Qdisgust_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.pilot2.Qdisgust.model <-
+  describe_posterior(pilot2.Qdisgust.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.pilot2.Qdisgust.model, digits = 2)
+
+# MCMC chains
+pilot2.Qdisgust.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+pilot2.Qdisgust.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(pilot2.Qdisgust.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 2, \"disgusted\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r pilot2_Qdisgust_hypothesis_testing}
+
+pilot2.Qdisgust.posterior.test <- pilot2.Qdisgust.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (disgust minus others)
+    ## high variability
+    # disgust minus neutral
+    diff.high.disgustVSneutral = `disgust, high variability` - `neutral, high variability`,
+    # disgust minus anger
+    diff.high.disgustVSanger = `disgust, high variability` - `anger, high variability`,
+    # disgust minus happiness
+    diff.high.disgustVShappiness = `disgust, high variability` - `happiness, high variability`,
+    ## low variability
+    # disgust minus neutral
+    diff.low.disgustVSneutral = `disgust, low variability` - `neutral, low variability`,
+    # disgust minus anger
+    diff.low.disgustVSanger = `disgust, low variability` - `anger, low variability`,
+    # disgust minus happiness
+    diff.low.disgustVShappiness = `disgust, low variability` - `happiness, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.disgustVSneutral",
+    "diff.high.disgustVSanger",
+    "diff.high.disgustVShappiness",
+    "diff.low.disgustVSneutral",
+    "diff.low.disgustVSanger",
+    "diff.low.disgustVShappiness",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.disgustVSneutral", "diff.high.disgustVSanger", "diff.high.disgustVShappiness",
+      "diff.low.disgustVSneutral", "diff.low.disgustVSanger", "diff.low.disgustVShappiness",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.pilot2.Qdisgust.posterior.test <- pilot2.Qdisgust.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.pilot2.Qdisgust.posterior.test, digits = 2)
+
+### Disgust vs. others ###
+
+pilot2.Qdisgust.posterior.test.emoref <- filter(
+  pilot2.Qdisgust.posterior.test,
+  condition == c(
+    "diff.high.disgustVSneutral", "diff.high.disgustVSanger", "diff.high.disgustVShappiness",
+    "diff.low.disgustVSneutral", "diff.low.disgustVSanger", "diff.low.disgustVShappiness"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(pilot2.Qdisgust.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(pilot2.Qdisgust.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+pilot2.Qdisgust.posterior.test.var <- filter(
+  pilot2.Qdisgust.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(pilot2.Qdisgust.posterior.test.var$condition))) {
+  
+  temp.data <- filter(pilot2.Qdisgust.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less disgusted than disgusted faces, in both within-emotion variabilities
+- angry faces are rated as more disgusted in low compared to high within-emotion variability
+- neutral faces are rated as more disgusted in high compared to low within-emotion variability
+- disgusted faces are rated as similarly disgusted in high and low within-emotion variability
+
+***
+***
+
+# Experiment 1
+
+* 2 face identities 
+* 3 emotions (anger, happiness, disgust)
+
+## How ANGRY are these faces?
+
+```{r exp1_Qangry_brms, eval = FALSE}
+
+# subset data
+exp1.Qangry.ratings <- ratings %>%
+  filter(exp == "exp1", question == "angry") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("anger", "neutral", "happiness", "disgust") # sort anger first
+  ))
+
+exp1.Qangry.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = exp1.Qangry.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp1.Qangry.model, file = "exp1_Qangry_model.rds", compress = "gzip")
+
+```
+
+```{r exp1_Qangry_model_diagnostics}
+
+# subset data
+exp1.Qangry.ratings <- ratings %>%
+  filter(exp == "exp1", question == "angry") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("anger", "neutral", "happiness", "disgust") # sort anger first
+  ))
+
+# load model
+exp1.Qangry.model <- readRDS("exp1_Qangry_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp1.Qangry.model <-
+  describe_posterior(exp1.Qangry.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp1.Qangry.model, digits = 2)
+
+# MCMC chains
+exp1.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+exp1.Qangry.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(exp1.Qangry.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 2, \"anger\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r exp1_Qangry_hypothesis_testing}
+
+exp1.Qangry.posterior.test <- exp1.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (anger minus others)
+    ## high variability
+    # anger minus neutral
+    diff.high.angerVSneutral = `anger, high variability` - `neutral, high variability`,
+    # anger minus happiness
+    diff.high.angerVShappiness = `anger, high variability` - `happiness, high variability`,
+    # anger minus disgust
+    diff.high.angerVSdisgust = `anger, high variability` - `disgust, high variability`,
+    ## low variability
+    # anger minus neutral
+    diff.low.angerVSneutral = `anger, low variability` - `neutral, low variability`,
+    # anger minus happiness
+    diff.low.angerVShappiness = `anger, low variability` - `happiness, low variability`,
+    # anger minus disgust
+    diff.low.angerVSdisgust = `anger, low variability` - `disgust, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.angerVSneutral",
+    "diff.high.angerVShappiness",
+    "diff.high.angerVSdisgust",
+    "diff.low.angerVSneutral",
+    "diff.low.angerVShappiness",
+    "diff.low.angerVSdisgust",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.angerVSneutral", "diff.high.angerVShappiness", "diff.high.angerVSdisgust",
+      "diff.low.angerVSneutral", "diff.low.angerVShappiness", "diff.low.angerVSdisgust",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp1.Qangry.posterior.test <- exp1.Qangry.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp1.Qangry.posterior.test, digits = 2)
+
+### Anger vs. others ###
+
+exp1.Qangry.posterior.test.emoref <- filter(
+  exp1.Qangry.posterior.test,
+  condition == c(
+    "diff.high.angerVSneutral", "diff.high.angerVShappiness", "diff.high.angerVSdisgust",
+    "diff.low.angerVSneutral", "diff.low.angerVShappiness", "diff.low.angerVSdisgust"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(exp1.Qangry.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(exp1.Qangry.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+exp1.Qangry.posterior.test.var <- filter(
+  exp1.Qangry.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(exp1.Qangry.posterior.test.var$condition))) {
+  
+  temp.data <- filter(exp1.Qangry.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less angry than angry faces, in both within-emotion variabilities
+- angry and neutral faces are rated as angrier in high compared to low within-emotion variability
+- happy and disgusted faces are rated as similarly angry in high and low within-emotion variability
+
+***
+***
+
+## How HAPPY are these faces?
+
+```{r exp1_Qhappy_brms, eval = FALSE}
+
+# subset data
+exp1.Qhappy.ratings <- ratings %>%
+  filter(exp == "exp1", question == "happy") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("happiness", "neutral", "anger", "disgust") # sort happiness first
+  ))
+
+exp1.Qhappy.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = exp1.Qhappy.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp1.Qhappy.model, file = "exp1_Qhappy_model.rds", compress = "gzip")
+
+```
+
+```{r exp1_Qhappy_model_diagnostics}
+
+# subset data
+exp1.Qhappy.ratings <- ratings %>%
+  filter(exp == "exp1", question == "happy") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("happiness", "neutral", "anger", "disgust") # sort happiness first
+  ))
+
+# load model
+exp1.Qhappy.model <- readRDS("exp1_Qhappy_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp1.Qhappy.model <-
+  describe_posterior(exp1.Qhappy.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp1.Qhappy.model, digits = 2)
+
+# MCMC chains
+exp1.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+exp1.Qhappy.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(exp1.Qhappy.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("experiment 1, \"happiness\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r exp1_Qhappy_hypothesis_testing}
+
+exp1.Qhappy.posterior.test <- exp1.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (happiness minus others)
+    ## high variability
+    # happiness minus neutral
+    diff.high.happinessVSneutral = `happiness, high variability` - `neutral, high variability`,
+    # happiness minus anger
+    diff.high.happinessVSanger = `happiness, high variability` - `anger, high variability`,
+    # happiness minus disgust
+    diff.high.happinessVSdisgust = `happiness, high variability` - `disgust, high variability`,
+    ## low variability
+    # happiness minus neutral
+    diff.low.happinessVSneutral = `happiness, low variability` - `neutral, low variability`,
+    # happiness minus anger
+    diff.low.happinessVSanger = `happiness, low variability` - `anger, low variability`,
+    # happiness minus disgust
+    diff.low.happinessVSdisgust = `happiness, low variability` - `disgust, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.happinessVSneutral",
+    "diff.high.happinessVSanger",
+    "diff.high.happinessVSdisgust",
+    "diff.low.happinessVSneutral",
+    "diff.low.happinessVSanger",
+    "diff.low.happinessVSdisgust",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.happinessVSneutral", "diff.high.happinessVSanger", "diff.high.happinessVSdisgust",
+      "diff.low.happinessVSneutral", "diff.low.happinessVSanger", "diff.low.happinessVSdisgust",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp1.Qhappy.posterior.test <- exp1.Qhappy.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp1.Qhappy.posterior.test, digits = 2)
+
+### Happiness vs. others ###
+
+exp1.Qhappy.posterior.test.emoref <- filter(
+  exp1.Qhappy.posterior.test,
+  condition == c(
+    "diff.high.happinessVSneutral", "diff.high.happinessVSanger", "diff.high.happinessVSdisgust",
+    "diff.low.happinessVSneutral", "diff.low.happinessVSanger", "diff.low.happinessVSdisgust"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(exp1.Qhappy.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(exp1.Qhappy.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+exp1.Qhappy.posterior.test.var <- filter(
+  exp1.Qhappy.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(exp1.Qhappy.posterior.test.var$condition))) {
+  
+  temp.data <- filter(exp1.Qhappy.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less happy than happy faces, in both within-emotion variabilities
+- angry and neutral faces are rated as happier in low compared to high within-emotion variability
+- happy and disgusted faces are rated as similarly happy in high and low within-emotion variability
+
+***
+***
+
+## How DISGUSTED are these faces?
+
+```{r exp1_Qdisgust_brms, eval = FALSE}
+
+# subset data
+exp1.Qdisgust.ratings <- ratings %>%
+  filter(exp == "exp1", question == "disgusted") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("disgust", "neutral", "anger", "happiness") # sort disgust first
+  ))
+
+exp1.Qdisgust.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = exp1.Qdisgust.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp1.Qdisgust.model, file = "exp1_Qdisgust_model.rds", compress = "gzip")
+
+```
+
+```{r exp1_Qdisgust_model_diagnostics}
+
+# subset data
+exp1.Qdisgust.ratings <- ratings %>%
+  filter(exp == "exp1", question == "disgusted") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("disgust", "neutral", "anger", "happiness") # sort disgust first
+  ))
+
+# load model
+exp1.Qdisgust.model <- readRDS("exp1_Qdisgust_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp1.Qdisgust.model <-
+  describe_posterior(exp1.Qdisgust.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp1.Qdisgust.model, digits = 2)
+
+# MCMC chains
+exp1.Qdisgust.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+
+### observed vs. predicted data ###
+exp1.Qdisgust.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(exp1.Qdisgust.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("experiment 1, \"disgusted\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r exp1_Qdisgust_hypothesis_testing}
+
+exp1.Qdisgust.posterior.test <- exp1.Qdisgust.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (disgust minus others)
+    ## high variability
+    # disgust minus neutral
+    diff.high.disgustVSneutral = `disgust, high variability` - `neutral, high variability`,
+    # disgust minus anger
+    diff.high.disgustVSanger = `disgust, high variability` - `anger, high variability`,
+    # disgust minus happiness
+    diff.high.disgustVShappiness = `disgust, high variability` - `happiness, high variability`,
+    ## low variability
+    # disgust minus neutral
+    diff.low.disgustVSneutral = `disgust, low variability` - `neutral, low variability`,
+    # disgust minus anger
+    diff.low.disgustVSanger = `disgust, low variability` - `anger, low variability`,
+    # disgust minus happiness
+    diff.low.disgustVShappiness = `disgust, low variability` - `happiness, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.disgustVSneutral",
+    "diff.high.disgustVSanger",
+    "diff.high.disgustVShappiness",
+    "diff.low.disgustVSneutral",
+    "diff.low.disgustVSanger",
+    "diff.low.disgustVShappiness",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.disgustVSneutral", "diff.high.disgustVSanger", "diff.high.disgustVShappiness",
+      "diff.low.disgustVSneutral", "diff.low.disgustVSanger", "diff.low.disgustVShappiness",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp1.Qdisgust.posterior.test <- exp1.Qdisgust.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp1.Qdisgust.posterior.test, digits = 2)
+
+### Disgust vs. others ###
+
+exp1.Qdisgust.posterior.test.emoref <- filter(
+  exp1.Qdisgust.posterior.test,
+  condition == c(
+    "diff.high.disgustVSneutral", "diff.high.disgustVSanger", "diff.high.disgustVShappiness",
+    "diff.low.disgustVSneutral", "diff.low.disgustVSanger", "diff.low.disgustVShappiness"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(exp1.Qdisgust.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(exp1.Qdisgust.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+exp1.Qdisgust.posterior.test.var <- filter(
+  exp1.Qdisgust.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(exp1.Qdisgust.posterior.test.var$condition))) {
+  
+  temp.data <- filter(exp1.Qdisgust.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less disgusted than disgusted faces, in both within-emotion variabilities
+- all faces are rated as similarly disgusted in high and low within-emotion variability
+
+***
+***
+
+# Experiment 2
+
+* 2 face identities 
+* 3 emotions (anger, happiness, disgust)
+
+## How ANGRY are these faces?
+
+```{r exp2_Qangry_brms, eval = FALSE}
+
+# subset data
+exp2.Qangry.ratings <- ratings %>%
+  filter(exp == "exp2", question == "angry") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("anger", "neutral", "happiness", "disgust") # sort anger first
+  ))
+
+exp2.Qangry.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = exp2.Qangry.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp2.Qangry.model, file = "exp2_Qangry_model.rds", compress = "gzip")
+
+```
+
+```{r exp2_Qangry_model_diagnostics}
+
+# subset data
+exp2.Qangry.ratings <- ratings %>%
+  filter(exp == "exp2", question == "angry") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("anger", "neutral", "happiness", "disgust") # sort anger first
+  ))
+
+# load model
+exp2.Qangry.model <- readRDS("exp2_Qangry_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp2.Qangry.model <-
+  describe_posterior(exp2.Qangry.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp2.Qangry.model, digits = 2)
+
+# MCMC chains
+exp2.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+exp2.Qangry.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(exp2.Qangry.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("pilot 2, \"anger\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r exp2_Qangry_hypothesis_testing}
+
+exp2.Qangry.posterior.test <- exp2.Qangry.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (anger minus others)
+    ## high variability
+    # anger minus neutral
+    diff.high.angerVSneutral = `anger, high variability` - `neutral, high variability`,
+    # anger minus happiness
+    diff.high.angerVShappiness = `anger, high variability` - `happiness, high variability`,
+    # anger minus disgust
+    diff.high.angerVSdisgust = `anger, high variability` - `disgust, high variability`,
+    ## low variability
+    # anger minus neutral
+    diff.low.angerVSneutral = `anger, low variability` - `neutral, low variability`,
+    # anger minus happiness
+    diff.low.angerVShappiness = `anger, low variability` - `happiness, low variability`,
+    # anger minus disgust
+    diff.low.angerVSdisgust = `anger, low variability` - `disgust, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.angerVSneutral",
+    "diff.high.angerVShappiness",
+    "diff.high.angerVSdisgust",
+    "diff.low.angerVSneutral",
+    "diff.low.angerVShappiness",
+    "diff.low.angerVSdisgust",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.angerVSneutral", "diff.high.angerVShappiness", "diff.high.angerVSdisgust",
+      "diff.low.angerVSneutral", "diff.low.angerVShappiness", "diff.low.angerVSdisgust",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp2.Qangry.posterior.test <- exp2.Qangry.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp2.Qangry.posterior.test, digits = 2)
+
+### Anger vs. others ###
+
+exp2.Qangry.posterior.test.emoref <- filter(
+  exp2.Qangry.posterior.test,
+  condition == c(
+    "diff.high.angerVSneutral", "diff.high.angerVShappiness", "diff.high.angerVSdisgust",
+    "diff.low.angerVSneutral", "diff.low.angerVShappiness", "diff.low.angerVSdisgust"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(exp2.Qangry.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(exp2.Qangry.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+exp2.Qangry.posterior.test.var <- filter(
+  exp2.Qangry.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(exp2.Qangry.posterior.test.var$condition))) {
+  
+  temp.data <- filter(exp2.Qangry.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less angry than angry faces, in both within-emotion variabilities
+- angry and neutral faces are rated as angrier in high compared to low within-emotion variability
+- happy and disgusted faces are rated as similarly angry in high and low within-emotion variability
+
+***
+***
+
+## How HAPPY are these faces?
+
+```{r exp2_Qhappy_brms, eval = FALSE}
+
+# subset data
+exp2.Qhappy.ratings <- ratings %>%
+  filter(exp == "exp2", question == "happy") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("happiness", "neutral", "anger", "disgust") # sort happiness first
+  ))
+
+exp2.Qhappy.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = exp2.Qhappy.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp2.Qhappy.model, file = "exp2_Qhappy_model.rds", compress = "gzip")
+
+```
+
+```{r exp2_Qhappy_model_diagnostics}
+
+# subset data
+exp2.Qhappy.ratings <- ratings %>%
+  filter(exp == "exp2", question == "happy") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("happiness", "neutral", "anger", "disgust") # sort happiness first
+  ))
+
+# load model
+exp2.Qhappy.model <- readRDS("exp2_Qhappy_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp2.Qhappy.model <-
+  describe_posterior(exp2.Qhappy.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp2.Qhappy.model, digits = 2)
+
+# MCMC chains
+exp2.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+exp2.Qhappy.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(exp2.Qhappy.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("experiment 2, \"happiness\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r exp2_Qhappy_hypothesis_testing}
+
+exp2.Qhappy.posterior.test <- exp2.Qhappy.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (happiness minus others)
+    ## high variability
+    # happiness minus neutral
+    diff.high.happinessVSneutral = `happiness, high variability` - `neutral, high variability`,
+    # happiness minus anger
+    diff.high.happinessVSanger = `happiness, high variability` - `anger, high variability`,
+    # happiness minus disgust
+    diff.high.happinessVSdisgust = `happiness, high variability` - `disgust, high variability`,
+    ## low variability
+    # happiness minus neutral
+    diff.low.happinessVSneutral = `happiness, low variability` - `neutral, low variability`,
+    # happiness minus anger
+    diff.low.happinessVSanger = `happiness, low variability` - `anger, low variability`,
+    # happiness minus disgust
+    diff.low.happinessVSdisgust = `happiness, low variability` - `disgust, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.happinessVSneutral",
+    "diff.high.happinessVSanger",
+    "diff.high.happinessVSdisgust",
+    "diff.low.happinessVSneutral",
+    "diff.low.happinessVSanger",
+    "diff.low.happinessVSdisgust",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.happinessVSneutral", "diff.high.happinessVSanger", "diff.high.happinessVSdisgust",
+      "diff.low.happinessVSneutral", "diff.low.happinessVSanger", "diff.low.happinessVSdisgust",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp2.Qhappy.posterior.test <- exp2.Qhappy.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp2.Qhappy.posterior.test, digits = 2)
+
+### Happiness vs. others ###
+
+exp2.Qhappy.posterior.test.emoref <- filter(
+  exp2.Qhappy.posterior.test,
+  condition == c(
+    "diff.high.happinessVSneutral", "diff.high.happinessVSanger", "diff.high.happinessVSdisgust",
+    "diff.low.happinessVSneutral", "diff.low.happinessVSanger", "diff.low.happinessVSdisgust"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(exp2.Qhappy.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(exp2.Qhappy.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+exp2.Qhappy.posterior.test.var <- filter(
+  exp2.Qhappy.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(exp2.Qhappy.posterior.test.var$condition))) {
+  
+  temp.data <- filter(exp2.Qhappy.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less happy than happy faces, in both within-emotion variabilities
+- angry and neutral faces are rated as happier in low compared to high within-emotion variability
+- happy and disgusted faces are rated as similarly happy in high and low within-emotion variability
+
+***
+***
+
+## How DISGUSTED are these faces?
+
+```{r exp2_Qdisgust_brms, eval = FALSE}
+
+# subset data
+exp2.Qdisgust.ratings <- ratings %>%
+  filter(exp == "exp2", question == "disgusted") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("disgust", "neutral", "anger", "happiness") # sort disgust first
+  ))
+
+exp2.Qdisgust.model <- brm(ratings ~ emotion : variability
++ (condition | participant),
+data = exp2.Qdisgust.ratings,
+family = cumulative("probit"),
+prior = weak.priors,
+sample_prior = TRUE,
+inits = "0",
+control = list(
+  adapt_delta = .99,
+  max_treedepth = 15
+),
+chains = num.chains,
+iter = num.iter,
+warmup = num.warmup,
+thin = num.thin,
+algorithm = "sampling",
+cores = num.chains,
+seed = seed.smorfia
+)
+
+saveRDS(exp2.Qdisgust.model, file = "exp2_Qdisgust_model.rds", compress = "gzip")
+
+```
+
+```{r exp2_Qdisgust_model_diagnostics}
+
+# subset data
+exp2.Qdisgust.ratings <- ratings %>%
+  filter(exp == "exp2", question == "disgusted") %>%
+  droplevels() %>%
+  mutate(emotion = factor(emotion,
+    levels = c("disgust", "neutral", "anger", "happiness") # sort disgust first
+  ))
+
+# load model
+exp2.Qdisgust.model <- readRDS("exp2_Qdisgust_model.rds")
+
+# summary posterior distributions & diagnostics
+summary.exp2.Qdisgust.model <-
+  describe_posterior(exp2.Qdisgust.model,
+    centrality = "mean",
+    ci = 0.95,
+    ci_method = "hdi",
+    test = NULL,
+    diagnostic = "all"
+  ) %>%
+  as_tibble() %>%
+  separate(Parameter, c("coef", "Parameter"), sep = "_") %>%
+  dplyr::select(-coef) %>%
+  mutate(Parameter = recode(factor(Parameter),
+    "Intercept.1." = "Intercept[1]",
+    "Intercept.2." = "Intercept[2]",
+    "Intercept.3." = "Intercept[3]",
+    "Intercept.4." = "Intercept[4]",
+    "Intercept.5." = "Intercept[5]",
+    "Intercept.6." = "Intercept[6]",
+    "Intercept.7." = "Intercept[7]",
+    "Intercept.8." = "Intercept[8]",
+    "emotionanger.variabilityhigh" = "anger, high variability",
+    "emotionneutral.variabilityhigh" = "neutral, high variability",
+    "emotionhappiness.variabilityhigh" = "happiness, high variability",
+    "emotiondisgust.variabilityhigh" = "disgust, high variability",
+    "emotionanger.variabilitylow" = "anger, low variability",
+    "emotionneutral.variabilitylow" = "neutral, low variability",
+    "emotionhappiness.variabilitylow" = "happiness, low variability",
+    "emotiondisgust.variabilitylow" = "disgust, low variability"
+  )) %>%
+  dplyr::select(Parameter, Mean, HDI95_Low = CI_low, HDI95_High = CI_high, Estimated_Sample_Size = ESS, MonteCarlo_StdErr = MCSE)
+
+kable(summary.exp2.Qdisgust.model, digits = 2)
+
+# MCMC chains
+exp2.Qdisgust.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select("Chain" = ".chain",
+                "Intercept[1]" = "b_Intercept[1]",
+                "Intercept[2]" = "b_Intercept[2]",
+                "Intercept[3]" = "b_Intercept[3]",
+                "Intercept[4]" = "b_Intercept[4]",
+                "Intercept[5]" = "b_Intercept[5]",
+                "Intercept[6]" = "b_Intercept[6]",
+                "Intercept[7]" = "b_Intercept[7]",
+                "Intercept[8]" = "b_Intercept[8]",
+                "anger, high variability" = "b_emotionanger:variabilityhigh",
+                "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+                "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+                "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+                "anger, low variability" = "b_emotionanger:variabilitylow",
+                "neutral, low variability" = "b_emotionneutral:variabilitylow",
+                "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+                "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  as.data.frame() %>%
+  mcmc_trace(facet_args = list(ncol = 2)) +
+  geom_vline(xintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5
+  ) +
+  ggtitle("Chain convergence") +
+  theme_EmoSSR +
+  theme(legend.position = "none")
+
+### observed vs. predicted data ###
+exp2.Qdisgust.ratings %>%
+  dplyr::select(exp, participant, question, emotion, variability, condition, ratings) %>% # reorder columns
+  mutate(predicted = posterior_predict(exp2.Qdisgust.model)[1, ]) %>% # take only first row of sampled ratings (as example)
+  dplyr::rename(observed = ratings) %>%
+  gather(key = data_type, value = ratings, observed:predicted) %>%
+  ggplot(aes(x = condition, 
+             y = ratings,
+             color = condition,
+             fill = condition)) +
+  geom_pirate(
+    bars = FALSE,
+    cis = TRUE,
+    lines = TRUE, lines_params = list(color = "black"),
+    points = TRUE, points_params = list(shape = 16, size = 5, alpha = .2),
+    violins = TRUE, violins_params = list(size = 1),
+    show.legend = FALSE
+  ) +
+  scale_fill_viridis_d(option = "cividis") +
+  scale_color_viridis_d(option = "cividis") +
+  scale_y_continuous(limits = c(1, 9),
+                     breaks = seq(1, 9, 1)) +
+  geom_hline(yintercept = seq(1, 9, 1),
+             linetype = "dotted",
+             colour = "#999999",
+             size = .8,
+             alpha = .5) +
+  facet_wrap( ~ data_type, scales = "free") +
+  xlab("") +
+  ggtitle("experiment 2, \"disgusted\" question ") +
+  theme_EmoSSR
+
+```
+
+```{r exp2_Qdisgust_hypothesis_testing}
+
+exp2.Qdisgust.posterior.test <- exp2.Qdisgust.model %>%
+  spread_draws(`b_.*`, regex = TRUE) %>%
+  dplyr::select(
+    "anger, high variability" = "b_emotionanger:variabilityhigh",
+    "neutral, high variability" = "b_emotionneutral:variabilityhigh",
+    "happiness, high variability" = "b_emotionhappiness:variabilityhigh",
+    "disgust, high variability" = "b_emotiondisgust:variabilityhigh",
+    "anger, low variability" = "b_emotionanger:variabilitylow",
+    "neutral, low variability" = "b_emotionneutral:variabilitylow",
+    "happiness, low variability" = "b_emotionhappiness:variabilitylow",
+    "disgust, low variability" = "b_emotiondisgust:variabilitylow"
+  ) %>%
+  mutate(
+    ### emotion (disgust minus others)
+    ## high variability
+    # disgust minus neutral
+    diff.high.disgustVSneutral = `disgust, high variability` - `neutral, high variability`,
+    # disgust minus anger
+    diff.high.disgustVSanger = `disgust, high variability` - `anger, high variability`,
+    # disgust minus happiness
+    diff.high.disgustVShappiness = `disgust, high variability` - `happiness, high variability`,
+    ## low variability
+    # disgust minus neutral
+    diff.low.disgustVSneutral = `disgust, low variability` - `neutral, low variability`,
+    # disgust minus anger
+    diff.low.disgustVSanger = `disgust, low variability` - `anger, low variability`,
+    # disgust minus happiness
+    diff.low.disgustVShappiness = `disgust, low variability` - `happiness, low variability`,
+    ### variability (high minus low)
+    # anger
+    diff.anger.highVSlow = `anger, high variability` - `anger, low variability`,
+    # neutral
+    diff.neutral.highVSlow = `neutral, high variability` - `neutral, low variability`,
+    # happiness
+    diff.happiness.highVSlow = `happiness, high variability` - `happiness, low variability`,
+    # disgust
+    diff.disgust.highVSlow = `disgust, high variability` - `disgust, low variability`
+  ) %>%
+  gather(key = "condition", value = "ratings") %>%
+  filter(condition == c(
+    "diff.high.disgustVSneutral",
+    "diff.high.disgustVSanger",
+    "diff.high.disgustVShappiness",
+    "diff.low.disgustVSneutral",
+    "diff.low.disgustVSanger",
+    "diff.low.disgustVShappiness",
+    "diff.anger.highVSlow",
+    "diff.neutral.highVSlow",
+    "diff.happiness.highVSlow",
+    "diff.disgust.highVSlow"
+  )) %>%
+  mutate(condition = factor(condition,
+    levels = c(
+      "diff.high.disgustVSneutral", "diff.high.disgustVSanger", "diff.high.disgustVShappiness",
+      "diff.low.disgustVSneutral", "diff.low.disgustVSanger", "diff.low.disgustVShappiness",
+      "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+    )
+  ))
+
+# summary
+summary.exp2.Qdisgust.posterior.test <- exp2.Qdisgust.posterior.test %>%
+  group_by(condition) %>%
+  dplyr::summarize(
+    mean = mean(ratings),
+    hdi.95.low = hdi(ratings)[1],
+    hdi.95.high = hdi(ratings)[2],
+    evidence.ratio = ifelse(mean < 0, 
+                            length(which(ratings < 0)) / length(which(ratings > 0)),
+                            length(which(ratings > 0)) / length(which(ratings < 0))
+    )
+  ) %>%
+  ungroup()
+
+kable(summary.exp2.Qdisgust.posterior.test, digits = 2)
+
+### Disgust vs. others ###
+
+exp2.Qdisgust.posterior.test.emoref <- filter(
+  exp2.Qdisgust.posterior.test,
+  condition == c(
+    "diff.high.disgustVSneutral", "diff.high.disgustVSanger", "diff.high.disgustVShappiness",
+    "diff.low.disgustVSneutral", "diff.low.disgustVSanger", "diff.low.disgustVShappiness"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(3, 2))
+
+for(i in 1:length(levels(exp2.Qdisgust.posterior.test.emoref$condition))) {
+  
+  temp.data <- filter(exp2.Qdisgust.posterior.test.emoref, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+### High vs. low variability ###
+
+exp2.Qdisgust.posterior.test.var <- filter(
+  exp2.Qdisgust.posterior.test,
+  condition == c(
+    "diff.anger.highVSlow", "diff.neutral.highVSlow", "diff.happiness.highVSlow", "diff.disgust.highVSlow"
+  )
+) %>%
+  droplevels()
+
+par(mfrow = c(2, 2))
+
+for(i in 1:length(levels(exp2.Qdisgust.posterior.test.var$condition))) {
+  
+  temp.data <- filter(exp2.Qdisgust.posterior.test.var, condition == levels(condition)[i])
+  
+  plotPost(
+    pull(temp.data, ratings), 
+    credMass = 0.95,
+    compVal = 0,
+    ROPE = NULL,
+    xlab = "", 
+    col = "#b3cde0", 
+    showCurve = FALSE,
+    cex = 1,
+    main = levels(temp.data$condition)[i]
+  )
+  
+}
+
+```
+
+## Take-home message:
+
+- all faces are rated as less disgusted than disgusted faces, in both within-emotion variabilities
+- all faces are rated as similarly disgusted in high and low within-emotion variability
+
+***
+***
