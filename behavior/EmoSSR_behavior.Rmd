@@ -37,7 +37,6 @@ library(brms)
 # summary and plotting
 library(bayesplot)
 library(tidybayes)
-# library(sjstats)
 library(bayestestR)
 library(BEST)
 library(viridis)
