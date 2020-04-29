@@ -6,4 +6,6 @@ This repository contains preprocessed data and analysis scripts of the following
 
 Data and analysis scripts of [participant demographics](https://github.com/aschetti/ssVEPs-faces/tree/master/demographics), behavioral data ([reaction times](https://github.com/aschetti/ssVEPs-faces/tree/master/behavior) and [face ratings](https://github.com/aschetti/ssVEPs-faces/tree/master/ratings)), and electrophysiological data ([Cosine Similarity Index](https://github.com/aschetti/ssVEPs-faces/tree/master/SSR) from steady-state responses at regular and stimulation frequencies) can be found in the respective subfolders. MATLAB preprocessing scripts can be found [here](https://github.com/aschetti/ssVEPs-faces/tree/master/EEG_preprocessing) for inspection. Materials and raw data can be found on the [OSF project page](https://osf.io/uhczc/).
 
+This repository is identical to the one on [GitLab](https://gitlab.com/aschetti/ssVEPs-faces), which has been linked to the OSF project.
+
 
